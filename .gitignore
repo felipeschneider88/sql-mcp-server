@@ -19,3 +19,4 @@ certs/*.key
 
 # macOS
 .DS_Store
+sql-mcp-server-py/__pycache__/*
