@@ -205,6 +205,15 @@ def _run_query(inst: InstanceConfig, sql: str, max_rows: int) -> dict:
         conn.close()
 
 
+def open_connection(instance_name: str):
+    """Open a raw pyodbc connection for tools that need multi-statement sessions (e.g. temp tables)."""
+    inst = _instances.get(instance_name)
+    if not inst:
+        available = ", ".join(_instances)
+        raise ValueError(f'Unknown instance "{instance_name}". Available: {available}')
+    return _open_connection(inst)
+
+
 async def query_instance(instance_name: str, sql: str, max_rows: int = 200) -> dict:
     inst = _instances.get(instance_name)
     if not inst:

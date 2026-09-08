@@ -1,13 +1,106 @@
 import asyncio
 import json
+import time
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated
 
 from pydantic import Field
 
-from connection import PendingAuthError, list_instances, query_instance
+from connection import PendingAuthError, list_instances, open_connection, query_instance
 from safety import validate_query
+
+# Wait types that indicate idle/background activity — not user-facing performance problems.
+# Used by both get_wait_stats (delta) and get_wait_stats_since_restart (cumulative).
+_BENIGN_WAITS = [
+    "SLEEP_TASK","SLEEP_SYSTEMTASK","SLEEP_DBSTARTUP","SLEEP_DBTASK",
+    "SLEEP_TEMPDBSTARTUP","SLEEP_MASTERDBREADY","SLEEP_MASTERMDREADY",
+    "SLEEP_MASTERUPGRADED","SLEEP_MSDBSTARTUP","SLEEP_REPLICATION_MONITOR",
+    "SLEEP_DCOMSTARTUP",
+    "BROKER_EVENTHANDLER","BROKER_RECEIVE_WAITFOR","BROKER_TASK_STOP",
+    "BROKER_TO_FLUSH","BROKER_TRANSMITTER","BROKER_IOCP",
+    "CHECKPOINT_QUEUE",
+    "CLR_AUTO_EVENT","CLR_MANUAL_EVENT","CLR_SEMAPHORE",
+    "DBMIRROR_DBM_EVENT","DBMIRROR_DBM_MUTEX","DBMIRROR_EVENTS_QUEUE",
+    "DBMIRROR_WORKER_QUEUE","DBMIRRORING_CMD","DBMIRROR_SEND",
+    "DIRTY_PAGE_POLL","DISPATCHER_QUEUE_SEMAPHORE",
+    "FT_IFTS_SCHEDULER_IDLE_WAIT","FT_IFTSHC_MUTEX",
+    "HADR_CLUSAPI_CALL","HADR_FABRIC_CALLBACK",
+    "HADR_FILESTREAM_IOMGR_IOCOMPLETION","HADR_LOGCAPTURE_WAIT",
+    "HADR_WORK_QUEUE",
+    "LAZYWRITER_SLEEP","LOGMGR_QUEUE",
+    "ONDEMAND_TASK_QUEUE",
+    "PARALLEL_REDO_DRAIN_WORKER","PARALLEL_REDO_LOG_CACHE",
+    "PARALLEL_REDO_TRAN_LIST","PARALLEL_REDO_TRAN_TURN",
+    "PARALLEL_REDO_WORKER_SYNC","PARALLEL_REDO_WORKER_WAIT_WORK",
+    "POPULATE_LOCK_ORDINALS",
+    "PREEMPTIVE_HADR_LEASE_MECHANISM","PREEMPTIVE_OS_FLUSHFILEBUFFERS",
+    "PREEMPTIVE_SP_SERVER_DIAGNOSTICS","PREEMPTIVE_OS_GETQUEUEDCOMPLETIONSTATUS",
+    "PVS_PREALLOCATE","PWAIT_EXTENSIBILITY_CLEANUP_TASK",
+    "QDS_ASYNC_QUEUE",
+    "QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP",
+    "QDS_PERSIST_TASK_MAIN_LOOP_SLEEP","QDS_SHUTDOWN_QUEUE",
+    "REDO_THREAD_PENDING_WORK","REQUEST_FOR_DEADLOCK_SEARCH",
+    "RESOURCE_QUEUE","SERVER_IDLE_CHECK","SNI_HTTP_ACCEPT",
+    "SOS_WORK_DISPATCHER","SP_SERVER_DIAGNOSTICS_SLEEP",
+    "SQLTRACE_BUFFER_FLUSH","SQLTRACE_INCREMENTAL_FLUSH_SLEEP","SQLTRACE_WAIT_ENTRIES",
+    "UCS_SESSION_REGISTRATION",
+    "WAIT_XTP_OFFLINE_CKPT_NEW_LOG","WAIT_XTP_ONLINE_CKPT_NEW_LOG",
+    "WAITFOR",
+    "XE_DISPATCHER_WAIT","XE_LIVE_TARGET_TVF","XE_TIMER_EVENT",
+]
+
+_BENIGN_IN = ", ".join(f"'{w}'" for w in _BENIGN_WAITS)
+
+
+def _run_wait_delta(instance_name: str, window_seconds: int, top_n: int) -> dict:
+    """
+    Snapshot sys.dm_os_wait_stats into a temp table, sleep window_seconds,
+    then return the delta — waits accumulated only during that window.
+    Runs entirely in one connection so the temp table survives across statements.
+    Blocking here is intentional and runs in asyncio.to_thread().
+    """
+    sql_baseline = f"""
+        SELECT wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms
+        INTO #WaitBaseline
+        FROM sys.dm_os_wait_stats
+        WHERE wait_type NOT IN ({_BENIGN_IN})
+          AND wait_time_ms > 0
+    """
+    sql_delta = f"""
+        SELECT TOP {top_n}
+            c.wait_type,
+            c.waiting_tasks_count - ISNULL(b.waiting_tasks_count, 0) AS delta_tasks,
+            c.wait_time_ms        - ISNULL(b.wait_time_ms, 0)        AS delta_wait_ms,
+            c.signal_wait_time_ms - ISNULL(b.signal_wait_time_ms, 0) AS delta_signal_ms,
+            CAST(
+                100.0 * (c.wait_time_ms - ISNULL(b.wait_time_ms, 0))
+                / NULLIF(SUM(c.wait_time_ms - ISNULL(b.wait_time_ms, 0)) OVER (), 0)
+            AS DECIMAL(5, 2))                                         AS pct_of_total
+        FROM sys.dm_os_wait_stats c
+        LEFT JOIN #WaitBaseline b ON b.wait_type = c.wait_type
+        WHERE c.wait_time_ms > ISNULL(b.wait_time_ms, 0)
+          AND c.wait_type NOT IN ({_BENIGN_IN})
+        ORDER BY delta_wait_ms DESC
+    """
+    conn = open_connection(instance_name)
+    try:
+        cur = conn.cursor()
+        cur.execute(sql_baseline)
+        time.sleep(window_seconds)
+        cur.execute(sql_delta)
+        cols = [col[0] for col in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        return {"rows": rows, "window_seconds": window_seconds}
+    finally:
+        conn.close()
+
+_registry: dict = {}
+
+
+def get_tool_registry() -> dict:
+    return _registry
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
@@ -171,58 +264,55 @@ def register_tools(mcp) -> None:
         instance_name: Annotated[str, Field(description=(
             "Named SQL Server instance to query. Call list_instances_tool to see available names."
         ))] = "default",
+        window_seconds: Annotated[int, Field(description=(
+            "Observation window in seconds. Snapshots wait stats before and after, "
+            "returns only waits that accumulated during this window. Default 10, max 60."
+        ), ge=2, le=60)] = 10,
+        top_n: Annotated[int, Field(description=(
+            "Number of wait types to return, ranked by delta_wait_ms. Default 10, max 30."
+        ), ge=1, le=30)] = 10,
+    ) -> str:
+        """
+        Get wait statistics accumulated during a live observation window (snapshot delta).
+        Takes a baseline, waits window_seconds, then returns only the waits that grew
+        during that period — immune to historical noise from restart-time or past incidents.
+        Use this during active incidents. For historical trending use get_wait_stats_since_restart.
+        """
+        try:
+            result = await asyncio.to_thread(
+                _run_wait_delta, instance_name, window_seconds, top_n
+            )
+        except PendingAuthError as e:
+            return _auth_required(e.device_code_info)
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+        return to_json({
+            "wait_stats_delta": result["rows"],
+            "window_seconds": result["window_seconds"],
+            "note": "Only waits that grew during the observation window are shown.",
+        })
+
+    @mcp.tool()
+    async def get_wait_stats_since_restart(
+        instance_name: Annotated[str, Field(description=(
+            "Named SQL Server instance to query. Call list_instances_tool to see available names."
+        ))] = "default",
         exclude_benign: Annotated[bool, Field(description=(
             "Exclude known idle/background waits to focus on actionable waits. Default true."
         ))] = True,
     ) -> str:
         """
         Get cumulative wait statistics since last SQL Server restart.
+        Useful for trending and identifying chronic patterns, but skewed by historical load.
+        For live incident triage use get_wait_stats (snapshot delta) instead.
         Key signals: PAGEIOLATCH_* = disk I/O; LCK_* = lock contention;
         CXPACKET/CXCONSUMER = parallelism; SOS_SCHEDULER_YIELD = CPU pressure;
         RESOURCE_SEMAPHORE = memory grants.
         """
-        benign = [
-            "SLEEP_TASK","SLEEP_SYSTEMTASK","SLEEP_DBSTARTUP","SLEEP_DBTASK",
-            "SLEEP_TEMPDBSTARTUP","SLEEP_MASTERDBREADY","SLEEP_MASTERMDREADY",
-            "SLEEP_MASTERUPGRADED","SLEEP_MSDBSTARTUP","SLEEP_REPLICATION_MONITOR",
-            "BROKER_EVENTHANDLER","BROKER_RECEIVE_WAITFOR","BROKER_TASK_STOP",
-            "BROKER_TO_FLUSH","BROKER_TRANSMITTER",
-            "CHECKPOINT_QUEUE",
-            "CLR_AUTO_EVENT","CLR_MANUAL_EVENT","CLR_SEMAPHORE",
-            "DBMIRROR_DBM_EVENT","DBMIRROR_DBM_MUTEX","DBMIRROR_EVENTS_QUEUE",
-            "DBMIRROR_WORKER_QUEUE","DBMIRRORING_CMD",
-            "DIRTY_PAGE_POLL","DISPATCHER_QUEUE_SEMAPHORE",
-            "FT_IFTS_SCHEDULER_IDLE_WAIT","FT_IFTSHC_MUTEX",
-            "HADR_CLUSAPI_CALL","HADR_FABRIC_CALLBACK",
-            "HADR_FILESTREAM_IOMGR_IOCOMPLETION","HADR_LOGCAPTURE_WAIT",
-            "HADR_WORK_QUEUE",
-            "LAZYWRITER_SLEEP","LOGMGR_QUEUE",
-            "ONDEMAND_TASK_QUEUE",
-            "PARALLEL_REDO_DRAIN_WORKER","PARALLEL_REDO_LOG_CACHE",
-            "PARALLEL_REDO_TRAN_LIST","PARALLEL_REDO_TRAN_TURN",
-            "PARALLEL_REDO_WORKER_SYNC","PARALLEL_REDO_WORKER_WAIT_WORK",
-            "POPULATE_LOCK_ORDINALS",
-            "PREEMPTIVE_HADR_LEASE_MECHANISM","PREEMPTIVE_OS_FLUSHFILEBUFFERS",
-            "PREEMPTIVE_SP_SERVER_DIAGNOSTICS",
-            "PVS_PREALLOCATE","PWAIT_EXTENSIBILITY_CLEANUP_TASK",
-            "QDS_ASYNC_QUEUE",
-            "QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP",
-            "QDS_PERSIST_TASK_MAIN_LOOP_SLEEP","QDS_SHUTDOWN_QUEUE",
-            "REDO_THREAD_PENDING_WORK","REQUEST_FOR_DEADLOCK_SEARCH",
-            "RESOURCE_QUEUE","SERVER_IDLE_CHECK","SNI_HTTP_ACCEPT",
-            "SOS_WORK_DISPATCHER","SP_SERVER_DIAGNOSTICS_SLEEP",
-            "SQLTRACE_BUFFER_FLUSH","SQLTRACE_INCREMENTAL_FLUSH_SLEEP",
-            "UCS_SESSION_REGISTRATION",
-            "WAIT_XTP_OFFLINE_CKPT_NEW_LOG",
-            "WAITFOR",
-            "XE_DISPATCHER_WAIT","XE_LIVE_TARGET_TVF","XE_TIMER_EVENT",
-        ]
-        benign_filter = (
-            "AND wait_type NOT IN ({})".format(
-                ", ".join(f"'{w}'" for w in benign)
-            )
-            if exclude_benign else ""
-        )
+        benign_filter = f"AND wait_type NOT IN ({_BENIGN_IN})" if exclude_benign else ""
 
         sql = f"""
           SELECT
@@ -821,3 +911,147 @@ def register_tools(mcp) -> None:
             output["key_configurations"] = "Not available on Azure SQL — managed at platform level."
 
         return to_json(output)
+
+    # ─────────────────────────────────────────────────────────────────────
+
+    @mcp.tool()
+    async def get_system_triage(
+        instance_name: Annotated[str, Field(description=(
+            "Named SQL Server instance to query. Call list_instances_tool to see available names."
+        ))] = "default",
+    ) -> str:
+        """
+        Phase 1 system pulse — run this first during any incident to identify the root bottleneck.
+
+        Returns three parallel snapshots:
+          • resource_stats: CPU / IO / log / worker / session % for the last 15 minutes
+            (Azure SQL only — skipped on on-prem where sys.dm_db_resource_stats is unavailable)
+          • session_routing: active request counts grouped by wait_type, with a routing
+            signal — GOTO PHASE 2 (CPU/parallelism), GOTO PHASE 3 (lock contention),
+            GOTO PHASE 4 (IO/memory), or MONITOR
+          • lock_contention: summary of waiting lock requests grouped by resource type,
+            mode, and database — non-zero rows confirm Phase 3 is needed
+
+        The top-level recommended_action field summarises the dominant routing signal
+        so you can immediately know where to look next.
+        """
+        # Azure SQL only — on-prem lacks sys.dm_db_resource_stats
+        sql_resource = """
+          SELECT TOP 15
+            end_time,
+            avg_cpu_percent,
+            avg_data_io_percent,
+            avg_log_write_percent,
+            max_worker_percent,
+            max_session_percent
+          FROM sys.dm_db_resource_stats
+          WHERE end_time >= DATEADD(MINUTE, -15, GETDATE())
+          ORDER BY end_time DESC
+        """
+
+        sql_routing = """
+          SELECT
+            COUNT(*)                              AS active_sessions,
+            r.status,
+            COALESCE(r.wait_type, 'None')         AS wait_type,
+            CASE
+              WHEN r.wait_type IN (
+                'CXCONSUMER','CXSYNC_PORT','SOS_SCHEDULER_YIELD'
+              ) THEN 'GOTO PHASE 2'
+              WHEN r.wait_type IN (
+                'RESOURCE_SEMAPHORE','WRITELOG',
+                'PAGEIOLATCH_SH','PAGEIOLATCH_EX',
+                'RESERVED_MEMORY_ALLOCATION_EXT'
+              ) THEN 'GOTO PHASE 4'
+              WHEN r.wait_type IN (
+                'LCK_M_S_XACT_MODIFY','LCK_M_IX',
+                'LCK_M_S','LCK_M_X',
+                'LCK_M_U','LCK_M_SCH_S','LCK_M_SCH_M',
+                'PAGELATCH_SH','PAGELATCH_EX'
+              ) THEN 'GOTO PHASE 3'
+              ELSE 'MONITOR'
+            END                                   AS routing
+          FROM sys.dm_exec_requests r
+          JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
+          WHERE r.status NOT IN ('background', 'sleeping')
+          GROUP BY r.status, r.wait_type
+          ORDER BY active_sessions DESC
+        """
+
+        sql_locks = """
+          SELECT
+            DB_NAME(resource_database_id)         AS database_name,
+            resource_type,
+            resource_subtype,
+            request_mode,
+            request_type,
+            request_status,
+            COUNT(*)                              AS lock_count,
+            SUM(CASE WHEN request_status = 'WAIT' THEN 1 ELSE 0 END) AS waiting_requests
+          FROM sys.dm_tran_locks
+          WHERE resource_database_id > 4
+          GROUP BY resource_database_id, resource_type, resource_subtype,
+                   request_mode, request_type, request_status
+          HAVING SUM(CASE WHEN request_status = 'WAIT' THEN 1 ELSE 0 END) > 0
+          ORDER BY waiting_requests DESC
+        """
+
+        resource_task, routing_task, locks_task = await asyncio.gather(
+            query_instance(instance_name, sql_resource, max_rows=15),
+            query_instance(instance_name, sql_routing, max_rows=100),
+            query_instance(instance_name, sql_locks, max_rows=100),
+            return_exceptions=True,
+        )
+
+        for outcome in (resource_task, routing_task, locks_task):
+            if isinstance(outcome, PendingAuthError):
+                return _auth_required(outcome.device_code_info)
+
+        output: dict = {}
+
+        # Resource stats — Azure SQL only
+        if isinstance(resource_task, Exception):
+            output["resource_stats"] = "Not available on on-prem — sys.dm_db_resource_stats is Azure SQL only."
+        else:
+            output["resource_stats"] = resource_task["rows"]
+
+        # Session routing
+        if isinstance(routing_task, Exception):
+            output["session_routing"] = {"error": str(routing_task)}
+            output["recommended_action"] = "UNKNOWN — routing query failed"
+        else:
+            rows = routing_task["rows"]
+            output["session_routing"] = rows
+            # Derive dominant action: highest active_sessions with a non-MONITOR routing
+            dominant = next(
+                (r["routing"] for r in rows if r.get("routing") != "MONITOR"),
+                "MONITOR",
+            )
+            output["recommended_action"] = dominant
+
+        # Lock contention summary
+        if isinstance(locks_task, Exception):
+            output["lock_contention"] = {"error": str(locks_task)}
+        else:
+            output["lock_contention"] = locks_task["rows"] or []
+
+        return to_json(output)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Direct HTTP /run registry — maps tool name → callable
+    # ─────────────────────────────────────────────────────────────────────
+    _registry.update({
+        "list_instances_tool":          list_instances_tool,
+        "execute_query":                execute_query,
+        "get_active_sessions":          get_active_sessions,
+        "get_wait_stats":               get_wait_stats,
+        "get_wait_stats_since_restart": get_wait_stats_since_restart,
+        "get_top_queries":              get_top_queries,
+        "get_long_running_transactions": get_long_running_transactions,
+        "get_plan_cache_pollution":     get_plan_cache_pollution,
+        "get_missing_indexes":          get_missing_indexes,
+        "get_memory_usage":             get_memory_usage,
+        "get_database_info":            get_database_info,
+        "get_server_info":              get_server_info,
+        "get_system_triage":            get_system_triage,
+    })
