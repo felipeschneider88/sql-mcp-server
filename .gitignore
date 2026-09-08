@@ -1,6 +1,12 @@
 # Environment files
 .env
 
+# Python
+sql-mcp-server-py/venv/
+sql-mcp-server-py/packages/
+sql-mcp-server-py/__pycache__/
+sql-mcp-server-py/*.pyc
+
 # Node
 node_modules/
 sql-mcp-server/dist/

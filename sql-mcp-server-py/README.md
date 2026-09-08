@@ -15,10 +15,21 @@ MCP server for Azure SQL / SQL Server DBA tooling. Supports Azure AD MFA (device
 
 ```bash
 cd sql-mcp-server-py
-pip install -r requirements.txt
+pip install --target=./packages -r requirements.txt
+python server.py
 ```
 
-This pulls in `mcp`, `uvicorn`, `starlette`, `azure-identity`, `pyodbc`, and `python-dotenv`.
+`server.py` automatically adds `./packages` to `sys.path` if the folder exists, so no environment variables or activation needed.
+
+> **Why `--target`?** Corporate environments with roaming profiles or group policies that block `venv` need a local install folder instead. The `--target` flag installs directly into the project directory, isolated from system/roaming packages.
+
+> **If your machine allows venv** (and you prefer it):
+> ```bash
+> python -m venv venv
+> venv\Scripts\activate
+> pip install -r requirements.txt
+> python server.py
+> ```
 
 ---
 
